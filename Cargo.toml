@@ -9,4 +9,4 @@ edition = "2021"
 ndarray = "0.16.1"
 num-traits = "0.2.19"
 ordered-float = "4.3.0"
-rust-string-random = "0.1.0"
+rust-string-random = {git = "https://github.com/NnannaOmoke/rust-string-random.git"}
