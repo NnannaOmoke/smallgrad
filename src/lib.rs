@@ -10,6 +10,8 @@ use rust_string_random::RandWay;
 
 use std::cmp::Ordering;
 
+use std::collections::HashSet;
+
 use std::fmt::Debug;
 use std::fmt::Display;
 
@@ -99,11 +101,11 @@ impl ValueOp {
             Self::Exp => T::exp(value_two.data),
             Self::Sin => T::cos(value_two.data),
             Self::Cos => T::sin(value_two.data.neg()),
-            Self::Tan => T::one() / T::cos(value_two.data),
+            Self::Tan => T::one() / T::cos(value_two.data).powi(2),
             Self::Ln => T::one() / value_two.data,
             Self::Sinh => T::cosh(value_two.data),
             Self::Cosh => T::sinh(value_two.data),
-            Self::Tanh => T::one() / T::cosh(value_two.data),
+            Self::Tanh => T::one() / T::cosh(value_two.data).powi(2),
             Self::Relu => {
                 if value_two.data > T::zero() {
                     T::one()
@@ -158,7 +160,7 @@ impl<T: SmallgradFloat> Value<T> {
         self.ident = ident.to_string();
     }
 
-    pub fn init_backprop(&mut self) {
+    pub fn init_backprop_recursive(&mut self) {
         self.grad = T::one();
         self.__backprop();
     }
@@ -197,11 +199,71 @@ impl<T: SmallgradFloat> Value<T> {
             val.push(node_one.__compute_grad_wrt(&self.op, Some(node_two)));
             val.push(node_two.__compute_grad_wrt(&self.op, Some(node_one)));
         } else {
-            val.push(T::one());
+            val.push(self.children[0].__compute_grad_wrt(&self.op, None));
         }
         zip(val, &mut self.children).for_each(|(grad, val)| val.grad = self.grad * grad);
         for child in self.children.iter_mut() {
             child.__backprop();
+        }
+    }
+
+    fn __backprop_non_recursive(&mut self) {
+        if self.op == ValueOp::None || self.children.len() == 0 {
+            return;
+        }
+        let mut val = vec![];
+        if self.children.len() == 2 {
+            let (node_one, node_two) = (&self.children[0], &self.children[1]);
+            val.push(node_one.__compute_grad_wrt(&self.op, Some(node_two)));
+            val.push(node_two.__compute_grad_wrt(&self.op, Some(node_one)));
+        } else {
+            val.push(self.children[0].__compute_grad_wrt(&self.op, None));
+        }
+        zip(val, &mut self.children).for_each(|(grad, val)| val.grad = self.grad * grad);
+    }
+
+    pub fn init_backprop(&mut self) {
+        self.grad = T::one();
+        let mut kids = unsafe { self.__toposort() };
+        for kid in kids.iter_mut().rev() {
+            (*kid).__backprop();
+        }
+    }
+
+    //this is unsafe cheese, please don't let this devalue my worth as a programmer :(
+    unsafe fn __toposort(&mut self) -> Vec<&mut Value<T>> {
+        let mut res = Vec::new();
+        let mut setcontain = HashSet::new();
+        unsafe fn __build_topo<'lt, T: SmallgradFloat>(
+            value: *mut Value<T>,
+            setcontain: &mut HashSet<String>,
+            vec: &mut Vec<*mut Value<T>>,
+        ) {
+            if setcontain.insert((*value).ident.clone()) {
+                for child in (*value).children.iter_mut() {
+                    let child = child as *mut Value<T>;
+                    __build_topo(child, setcontain, vec);
+                }
+                vec.push(value);
+            }
+        }
+        __build_topo(self, &mut setcontain, &mut res);
+        res.iter_mut()
+            .map(|e| e.as_mut().unwrap())
+            .collect::<Vec<_>>()
+    }
+
+    fn __traverse_dag(&mut self) {
+        let mut tracker = Vec::new();
+        let mut result = Vec::new();
+        let mut discovered = HashSet::new();
+        discovered.insert(self.ident.clone());
+        tracker.push(self);
+        loop {
+            if tracker.is_empty() {
+                break;
+            }
+            result.push(tracker.pop())
         }
     }
 }
@@ -221,10 +283,11 @@ macro_rules! impl_num_traits_no_assign {
                 let mut set = Vec::new();
                 let ident =
                     random(5, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
+                let val = self.data.$fnname(other.data);
                 set.push(other.clone());
-                set.push(self.clone());
+                set.push(self);
                 Self {
-                    data: self.data.$fnname(other.data),
+                    data: val,
                     children: set,
                     op: ValueOp::$op_ident,
                     grad: T::zero(),
@@ -241,12 +304,13 @@ macro_rules! impl_ref_ops {
             type Output = Value<T>;
             fn $fnname(self, other: &Value<T>) -> Self::Output {
                 let mut vec = Vec::new();
+                let val = self.data.$fnname(other.data);
                 let ident =
                     random(5, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
                 vec.push(self.clone());
                 vec.push(other.clone());
                 Value {
-                    data: self.data.$fnname(other.data),
+                    data: val,
                     children: vec,
                     op: ValueOp::$op_ident,
                     grad: T::zero(),
@@ -358,6 +422,16 @@ mod tests {
         inter.sin();
         let mut d = inter / c;
         d += Value::new(-1.5);
+        d.init_backprop();
+        dbg!(&d);
+    }
+
+    #[test]
+    fn test_toposort() {
+        let a = Value::new(56f32);
+        let b = Value::new(8f32);
+        let c = a * b;
+        let mut d = c * Value::new(2f32);
         d.init_backprop();
         dbg!(&d);
     }
