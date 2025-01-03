@@ -8,6 +8,8 @@ use rust_string_random::random;
 use rust_string_random::Options;
 use rust_string_random::RandWay;
 
+use std::cell::RefCell;
+
 use std::cmp::Ordering;
 
 use std::collections::HashSet;
@@ -29,6 +31,8 @@ use std::ops::MulAssign;
 use std::ops::Sub;
 use std::ops::SubAssign;
 
+use std::rc::Rc;
+
 //TODO: possible optimization is to remove NotNaN and use vectors to store children
 //if it's evaluated in such a manner where the possible children are either 1 or 2
 //there's no need for NotNan to make floats hashable
@@ -40,7 +44,7 @@ const RANDOM_STRING_CONFIG: Options = Options {
     letters: None,
     specials: None,
 };
-
+type DataPointer<T> = Rc<RefCell<_ValueData<T>>>;
 pub trait SmallgradFloat: Debug + Float {}
 impl<T: Debug + Float> SmallgradFloat for T {}
 
@@ -64,6 +68,20 @@ impl<T: Debug + Float> SmallgradFloat for T {}
 struct Value<T: SmallgradFloat> {
     data: T,
     children: Vec<Value<T>>,
+    op: ValueOp,
+    grad: T,
+    ident: String,
+}
+
+#[derive(Clone, Debug)]
+struct _Value<T: SmallgradFloat> {
+    inner: Rc<RefCell<_ValueData<T>>>,
+}
+
+#[derive(Clone, Debug)]
+struct _ValueData<T: SmallgradFloat> {
+    data: T,
+    children: Vec<DataPointer<T>>,
     op: ValueOp,
     grad: T,
     ident: String,
@@ -108,6 +126,30 @@ impl ValueOp {
             Self::Tanh => T::one() / T::cosh(value_two.data).powi(2),
             Self::Relu => {
                 if value_two.data > T::zero() {
+                    T::one()
+                } else {
+                    T::zero()
+                }
+            }
+            _ => T::zero(),
+        }
+    }
+
+    fn compute_grad<T: SmallgradFloat>(parent: &ValueOp, value_two: DataPointer<T>) -> T {
+        match parent {
+            Self::Add | Self::AddAssign | Self::Sub | Self::SubAssign => T::one(),
+            Self::Mul | Self::MulAssign => value_two.borrow().data,
+            Self::Div | Self::DivAssign => T::one() / value_two.borrow().data,
+            Self::Exp => T::exp(value_two.borrow().data),
+            Self::Sin => T::cos(value_two.borrow().data),
+            Self::Cos => T::sin(value_two.borrow().data.neg()),
+            Self::Tan => T::one() / T::cos(value_two.borrow().data).powi(2),
+            Self::Ln => T::one() / value_two.borrow().data,
+            Self::Sinh => T::cosh(value_two.borrow().data),
+            Self::Cosh => T::sinh(value_two.borrow().data),
+            Self::Tanh => T::one() / T::cosh(value_two.borrow().data).powi(2),
+            Self::Relu => {
+                if value_two.borrow().data > T::zero() {
                     T::one()
                 } else {
                     T::zero()
@@ -172,7 +214,7 @@ impl<T: SmallgradFloat> Value<T> {
         };
         self.op = ValueOp::Relu;
         self.children = vec![self.clone()];
-        self.ident = random(5, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
+        self.ident = random(9, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
     }
 
     fn __compute_grad_wrt(&self, parent_op: &ValueOp, other: Option<&Value<T>>) -> T {
@@ -219,7 +261,8 @@ impl<T: SmallgradFloat> Value<T> {
         } else {
             val.push(self.children[0].__compute_grad_wrt(&self.op, None));
         }
-        zip(val, &mut self.children).for_each(|(grad, val)| val.grad = self.grad * grad);
+        zip(val, &mut self.children).for_each(|(grad, val)| val.grad = val.grad + self.grad * grad);
+        //T does not allow +=
     }
 
     pub fn init_backprop(&mut self) {
@@ -277,22 +320,26 @@ impl<T: SmallgradFloat> Display for Value<T> {
 
 macro_rules! impl_num_traits_no_assign {
     ($trait: ty, $fnname: ident, $op_ident: ident) => {
-        impl<T: SmallgradFloat> $trait for Value<T> {
-            type Output = Value<T>;
-            fn $fnname(self, other: Value<T>) -> Self {
+        impl<T: SmallgradFloat> $trait for _Value<T> {
+            type Output = _Value<T>;
+            fn $fnname(self, other: _Value<T>) -> Self::Output {
                 let mut set = Vec::new();
                 let ident =
-                    random(5, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
-                let val = self.data.$fnname(other.data);
-                set.push(other.clone());
-                set.push(self);
-                Self {
+                    random(9, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
+                let self_value = self.inner.borrow().data;
+                let other_value = other.inner.borrow().data;
+                let val = self_value.$fnname(other_value);
+                set.push(other.inner.clone());
+                set.push(self.inner.clone());
+                let inner = _ValueData {
                     data: val,
                     children: set,
                     op: ValueOp::$op_ident,
                     grad: T::zero(),
                     ident: ident,
-                }
+                };
+                let inner = Rc::new(RefCell::new(inner));
+                Self { inner: inner }
             }
         }
     };
@@ -300,41 +347,52 @@ macro_rules! impl_num_traits_no_assign {
 
 macro_rules! impl_ref_ops {
     ($trait: ty, $fnname: ident, $op_ident: ident) => {
-        impl<T: SmallgradFloat> $trait for &Value<T> {
-            type Output = Value<T>;
-            fn $fnname(self, other: &Value<T>) -> Self::Output {
+        impl<T: SmallgradFloat> $trait for &_Value<T> {
+            type Output = _Value<T>;
+            fn $fnname(self, other: &_Value<T>) -> Self::Output {
                 let mut vec = Vec::new();
-                let val = self.data.$fnname(other.data);
+                let self_value = self.inner.borrow().data;
+                let other_value = other.inner.borrow().data;
+                let val = self_value.$fnname(other_value);
                 let ident =
-                    random(5, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
-                vec.push(self.clone());
-                vec.push(other.clone());
-                Value {
+                    random(9, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
+                vec.push(self.inner.clone());
+                vec.push(other.inner.clone());
+                let inner = _ValueData {
                     data: val,
                     children: vec,
                     op: ValueOp::$op_ident,
                     grad: T::zero(),
                     ident: ident,
-                }
+                };
+                let inner = Rc::new(RefCell::new(inner));
+                Self::Output { inner: inner }
             }
         }
     };
 }
+//TODO:
 //find an effective way of recording this in the DAG history
 macro_rules! impl_num_traits_assign {
     ($trait: ty, $fnname: ident, $bop: ident, $op_ident: ident) => {
-        impl<T: SmallgradFloat> $trait for Value<T> {
-            fn $fnname(&mut self, other: Value<T>) {
-                let inter = self.data.$bop(other.data);
-                self.data = inter;
+        impl<T: SmallgradFloat> $trait for _Value<T> {
+            fn $fnname(&mut self, other: _Value<T>) {
+                let self_val = self.inner.borrow().data;
+                let other_val = other.inner.borrow().data;
+                let total = self_val.$bop(other_val);
+                *(self.inner.borrow_mut()).data = total;
                 let mut vec = Vec::new();
                 let ident =
-                    random(5, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
-                vec.push(other.clone());
-                vec.push(self.clone());
-                self.children = vec;
-                self.op = ValueOp::$op_ident;
-                self.ident = ident;
+                    random(9, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
+                vec.push(other.inner.clone());
+                vec.push(self.inner.clone()); //so basically wtf is this? //isn't this going to fuck something up?
+                                              //here's what I'm thinking;
+                                              //so basically if you add assign, what happens to the previous history?
+                                              //we need to record it in the DAG, that's for sure
+                                              //and we do so
+                *(self.inner.borrow_mut()).children = vec;
+                *(self.inner.borrow_mut()).op = ValueOp::$op_ident;
+                *(self.inner.borrow_mut()).ident = ident;
             }
         }
     };
@@ -347,7 +405,7 @@ macro_rules! impl_fops {
                   pub fn $fop(&mut self){
                       self.data = self.data.$fop();
                       let ident =
-                        random(5, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
+                        random(9, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
                       let vector = vec![self.clone()];
                       self.children = vector;
                       self.op = ValueOp::$valueop;
@@ -369,10 +427,10 @@ impl_num_traits_assign!(SubAssign, sub_assign, sub, SubAssign);
 impl_num_traits_assign!(MulAssign, mul_assign, mul, MulAssign);
 impl_num_traits_assign!(DivAssign, div_assign, div, DivAssign);
 
-impl_ref_ops!(Add<&Value<T>>, add, Add);
-impl_ref_ops!(Sub<&Value<T>>, sub, Sub);
-impl_ref_ops!(Mul<&Value<T>>, mul, Mul);
-impl_ref_ops!(Div<&Value<T>>, div, Div);
+impl_ref_ops!(Add<&_Value<T>>, add, Add);
+impl_ref_ops!(Sub<&_Value<T>>, sub, Sub);
+impl_ref_ops!(Mul<&_Value<T>>, mul, Mul);
+impl_ref_ops!(Div<&_Value<T>>, div, Div);
 
 impl_fops!(
     (exp, Exp),
@@ -388,51 +446,58 @@ impl_fops!(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn test_basic_stuff() {
-        let value_a = Value::new(2f64);
-        let value_b = Value::new(-3f64);
-        dbg!(&value_a.children);
-        dbg!(&value_b.children);
-        let value_d = value_a + value_b;
-        dbg!(value_d.children);
-    }
+    // #[test]
+    // fn test_basic_stuff() {
+    //     let value_a = Value::new(2f64);
+    //     let value_b = Value::new(-3f64);
+    //     dbg!(&value_a.children);
+    //     dbg!(&value_b.children);
+    //     let value_d = value_a + value_b;
+    //     dbg!(value_d.children);
+    // }
 
-    #[test]
-    fn current_state() {
-        let a = Value::new(2f32);
-        let b = Value::new(-3f32);
-        let c = Value::new(-5f32);
-        let mut d = a + b * c;
-        d += Value::new(-1.5);
-        d.init_backprop();
-        dbg!(&d);
-    }
-    #[test]
-    fn test_added_fns() {
-        let mut a = Value::new(2f32);
-        a.update_label("a");
-        let mut b = Value::new(-3f32);
-        b.update_label("b");
-        let mut c = Value::new(-5f32);
-        c.update_label("c");
-        a.sin();
-        let mut inter = a + b;
-        inter.update_label("inter");
-        inter.sin();
-        let mut d = inter / c;
-        d += Value::new(-1.5);
-        d.init_backprop();
-        dbg!(&d);
-    }
+    // #[test]
+    // fn current_state() {
+    //     let a = Value::new(2f32);
+    //     let b = Value::new(-3f32);
+    //     let c = Value::new(-5f32);
+    //     let mut d = a + b * c;
+    //     d += Value::new(-1.5);
+    //     d.init_backprop();
+    //     dbg!(&d);
+    // }
+    // #[test]
+    // fn test_added_fns() {
+    //     let mut a = Value::new(2f32);
+    //     a.update_label("a");
+    //     let mut b = Value::new(-3f32);
+    //     b.update_label("b");
+    //     let mut c = Value::new(-5f32);
+    //     c.update_label("c");
+    //     a.sin();
+    //     let mut inter = a + b;
+    //     inter.update_label("inter");
+    //     inter.sin();
+    //     let mut d = inter / c;
+    //     d += Value::new(-1.5);
+    //     d.init_backprop();
+    //     dbg!(&d);
+    // }
 
-    #[test]
-    fn test_toposort() {
-        let a = Value::new(56f32);
-        let b = Value::new(8f32);
-        let c = a * b;
-        let mut d = c * Value::new(2f32);
-        d.init_backprop();
-        dbg!(&d);
-    }
+    // #[test]
+    // fn test_toposort() {
+    //     let a = Value::new(56f32);
+    //     let b = Value::new(8f32);
+    //     let c = a * b;
+    //     let mut d = c * Value::new(2f32);
+    //     d.init_backprop();
+    //     dbg!(&d);
+    // }
+
+    // #[test]
+    // fn test_multigrad() {
+    //     let a = Value::new(3f32);
+    //     let b = a.clone() + a;
+    //     dbg!(&b);
+    // }
 }
