@@ -44,8 +44,11 @@ const RANDOM_STRING_CONFIG: Options = Options {
     letters: None,
     specials: None,
 };
+
 type DataPointer<T> = Rc<RefCell<_ValueData<T>>>;
+
 pub trait SmallgradFloat: Debug + Float {}
+
 impl<T: Debug + Float> SmallgradFloat for T {}
 
 // trait Differentiable<T: SmallgradFloat> {
@@ -73,9 +76,78 @@ struct Value<T: SmallgradFloat> {
     ident: String,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 struct _Value<T: SmallgradFloat> {
-    inner: Rc<RefCell<_ValueData<T>>>,
+    inner: DataPointer<T>,
+}
+
+impl<T: SmallgradFloat> Clone for _Value<T> {
+    fn clone(&self) -> Self {
+        let inner_data = self.inner.borrow().clone();
+        let new_cell = Rc::new(RefCell::new(inner_data));
+        Self { inner: new_cell }
+    }
+}
+
+impl<T: SmallgradFloat> _Value<T> {
+    pub fn new(data: T) -> Self {
+        let inner = _ValueData::new(data);
+        let inner = Rc::new(RefCell::new(inner));
+        Self { inner }
+    }
+
+    pub fn new_with_label(data: T, label: &str) -> Self {
+        let mut inner = _ValueData::new(data);
+        inner.ident = label.to_string();
+        let inner = Rc::new(RefCell::new(inner));
+        Self { inner }
+    }
+
+    pub fn update_label(&mut self, ident: &str) {
+        //we don't need a mutable, but in-case of thread safety
+        (self.inner.borrow_mut()).ident = ident.to_string();
+    }
+
+    pub fn relu(&mut self) {
+        //it's a little more complicated now, but we first have to clone the old state
+        let prev_s = self.clone();
+        let prev_s_ = prev_s.inner.clone();
+        let mut bmut = self.inner.borrow_mut(); //b for borrow, just need it for convenience
+        if bmut.data <= T::zero() {
+            bmut.data = T::zero()
+        }
+        bmut.op = ValueOp::Relu;
+        bmut.children = vec![prev_s_];
+        bmut.ident = random(9, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
+    }
+
+    pub fn backwards(&mut self) {
+        self.inner.borrow_mut().grad = T::one();
+        let children = self.toposort();
+        for node in children.iter().rev() {
+            node.borrow_mut().backprop()
+        }
+    }
+
+    fn toposort(&mut self) -> Vec<DataPointer<T>> {
+        let mut res = Vec::new();
+        let mut set = HashSet::new();
+        fn build_topo<T: SmallgradFloat>(
+            value: DataPointer<T>,
+            tset: &mut HashSet<String>,
+            vec: &mut Vec<DataPointer<T>>,
+        ) {
+            let b = value.borrow();
+            if tset.insert(b.ident.clone()) {
+                for node in b.children.iter() {
+                    build_topo(node.clone(), tset, vec)
+                }
+                vec.push(value.clone());
+            }
+        }
+        build_topo(self.inner.clone(), &mut set, &mut res);
+        res
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +157,43 @@ struct _ValueData<T: SmallgradFloat> {
     op: ValueOp,
     grad: T,
     ident: String,
+}
+
+impl<T: SmallgradFloat> _ValueData<T> {
+    fn new(data: T) -> Self {
+        let label = random(9, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
+        Self {
+            data,
+            children: Vec::default(),
+            op: ValueOp::None,
+            grad: T::zero(),
+            ident: label,
+        }
+    }
+    pub fn compute_grad_wrt(&self, parent_op: ValueOp, other: Option<DataPointer<T>>) -> T {
+        if let Some(other_var) = other {
+            ValueOp::compute_grad(parent_op, &other_var.borrow())
+        } else {
+            ValueOp::compute_grad(parent_op, self)
+        }
+    }
+    fn backprop(&mut self) {
+        if self.op == ValueOp::None || self.children.is_empty() {
+            return;
+        }
+        let mut vals = vec![];
+        if self.children.len() == 2 {
+            let (n1, n2) = (self.children[0].clone(), self.children[1].clone());
+            vals.push(n1.borrow().compute_grad_wrt(self.op, Some(n2.clone())));
+            vals.push(n2.borrow().compute_grad_wrt(self.op, Some(n1.clone())));
+        } else {
+            vals.push(self.children[0].borrow().compute_grad_wrt(self.op, None))
+        }
+        zip(vals, &self.children).for_each(|(grad, val)| {
+            let total = val.borrow().grad + self.grad * grad;
+            val.borrow_mut().grad = total;
+        })
+    }
 }
 
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
@@ -134,22 +243,22 @@ impl ValueOp {
             _ => T::zero(),
         }
     }
-
-    fn compute_grad<T: SmallgradFloat>(parent: &ValueOp, value_two: DataPointer<T>) -> T {
+    //TODO: allow for desugaring of the input: AsRef<T>
+    fn compute_grad<T: SmallgradFloat>(parent: ValueOp, value_two: &_ValueData<T>) -> T {
         match parent {
             Self::Add | Self::AddAssign | Self::Sub | Self::SubAssign => T::one(),
-            Self::Mul | Self::MulAssign => value_two.borrow().data,
-            Self::Div | Self::DivAssign => T::one() / value_two.borrow().data,
-            Self::Exp => T::exp(value_two.borrow().data),
-            Self::Sin => T::cos(value_two.borrow().data),
-            Self::Cos => T::sin(value_two.borrow().data.neg()),
-            Self::Tan => T::one() / T::cos(value_two.borrow().data).powi(2),
-            Self::Ln => T::one() / value_two.borrow().data,
-            Self::Sinh => T::cosh(value_two.borrow().data),
-            Self::Cosh => T::sinh(value_two.borrow().data),
-            Self::Tanh => T::one() / T::cosh(value_two.borrow().data).powi(2),
+            Self::Mul | Self::MulAssign => value_two.data,
+            Self::Div | Self::DivAssign => T::one() / value_two.data,
+            Self::Exp => T::exp(value_two.data),
+            Self::Sin => T::cos(value_two.data),
+            Self::Cos => T::sin(value_two.data.neg()),
+            Self::Tan => T::one() / T::cos(value_two.data).powi(2),
+            Self::Ln => T::one() / value_two.data,
+            Self::Sinh => T::cosh(value_two.data),
+            Self::Cosh => T::sinh(value_two.data),
+            Self::Tanh => T::one() / T::cosh(value_two.data).powi(2),
             Self::Relu => {
-                if value_two.borrow().data > T::zero() {
+                if value_two.data > T::zero() {
                     T::one()
                 } else {
                     T::zero()
@@ -160,35 +269,40 @@ impl ValueOp {
     }
 }
 
-impl<T: SmallgradFloat> PartialEq for Value<T> {
-    fn eq(&self, other: &Value<T>) -> bool {
-        self.data == other.data || self.grad == other.grad || self.ident == other.ident
+impl<T: SmallgradFloat> PartialEq for _Value<T> {
+    fn eq(&self, other: &_Value<T>) -> bool {
+        self.inner.borrow().data == other.inner.borrow().data
+            || self.inner.borrow().grad == other.inner.borrow().grad
+            || self.inner.borrow().ident == other.inner.borrow().ident
     }
 }
 
-impl<T: SmallgradFloat> PartialOrd for Value<T> {
+impl<T: SmallgradFloat> PartialOrd for _Value<T> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        self.data.partial_cmp(&other.data)
+        self.inner
+            .borrow()
+            .data
+            .partial_cmp(&other.inner.borrow().data)
     }
 }
 
-impl<T: SmallgradFloat> Eq for Value<T> {}
+impl<T: SmallgradFloat> Eq for _Value<T> {}
 
-impl<T: SmallgradFloat> Ord for Value<T> {
+impl<T: SmallgradFloat> Ord for _Value<T> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.ident.cmp(&other.ident)
+        self.inner.borrow().ident.cmp(&other.inner.borrow().ident)
     }
 }
 
-impl<T: SmallgradFloat> Hash for Value<T> {
+impl<T: SmallgradFloat> Hash for _Value<T> {
     fn hash<H: Hasher>(&self, hasher: &mut H) {
-        self.ident.hash(hasher)
+        self.inner.borrow().ident.hash(hasher)
     }
 }
 
 impl<T: SmallgradFloat> Value<T> {
     pub fn new(data: T) -> Self {
-        let label = random(5, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
+        let label = random(9, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
         Self {
             data,
             children: Vec::default(),
@@ -311,10 +425,23 @@ impl<T: SmallgradFloat> Value<T> {
     }
 }
 
-impl<T: SmallgradFloat> Display for Value<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let str = format!("Value: {:?}", self.data);
-        write!(f, "{str}")
+impl<T: SmallgradFloat> Display for _ValueData<T> {
+    //hopefully this isn't very recursive, lol, will blow the stack for larger DAG's
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        let str = format! {"
+            Value: {:?},
+            Grad: {:?},
+            Name: {:?}
+            Children: [{:?}],
+            Op: {:?}
+        ", self.data, self.grad, self.ident, &self.children, self.op};
+        write!(f, "{}", str)
+    }
+}
+
+impl<T: SmallgradFloat> Display for _Value<T> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        write!(f, "{}", self.inner.borrow())
     }
 }
 
@@ -379,20 +506,22 @@ macro_rules! impl_num_traits_assign {
             fn $fnname(&mut self, other: _Value<T>) {
                 let self_val = self.inner.borrow().data;
                 let other_val = other.inner.borrow().data;
+                //this is the old state
+                let cloned = self.clone();
                 let total = self_val.$bop(other_val);
-                *(self.inner.borrow_mut()).data = total;
+                self.inner.borrow_mut().data = total;
                 let mut vec = Vec::new();
                 let ident =
                     random(9, RANDOM_STRING_CONFIG).expect("Random string initialization failed");
                 vec.push(other.inner.clone());
-                vec.push(self.inner.clone()); //so basically wtf is this? //isn't this going to fuck something up?
-                                              //here's what I'm thinking;
-                                              //so basically if you add assign, what happens to the previous history?
-                                              //we need to record it in the DAG, that's for sure
-                                              //and we do so
-                *(self.inner.borrow_mut()).children = vec;
-                *(self.inner.borrow_mut()).op = ValueOp::$op_ident;
-                *(self.inner.borrow_mut()).ident = ident;
+                vec.push(cloned.inner.clone()); //so basically wtf is this? //isn't this going to fuck something up?
+                                                //here's what I'm thinking;
+                                                //so basically if you add assign, what happens to the previous history?
+                                                //we need to record it in the DAG, that's for sure
+                                                //and we do so
+                (self.inner.borrow_mut()).children = vec;
+                (self.inner.borrow_mut()).op = ValueOp::$op_ident;
+                (self.inner.borrow_mut()).ident = ident;
             }
         }
     };
